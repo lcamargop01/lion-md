@@ -4,21 +4,61 @@ const auth = new Hono<{ Bindings: { DB: D1Database; RESEND_API_KEY: string } }>(
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// Password format stored in DB: "pbkdf2:{hex_salt}:{hex_hash}"
+// Algorithm: PBKDF2-HMAC-SHA256, 100,000 iterations, 16-byte salt, 32-byte key
+const PBKDF2_ITERATIONS = 100_000
+const SALT_BYTES = 16
+const KEY_BYTES = 32
+
+function buf2hex(buf: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function hex2buf(hex: string): Uint8Array {
+  const arr = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < arr.length; i++) arr[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  return arr
+}
+
 async function hashPassword(password: string): Promise<string> {
-  const encoder = new TextEncoder()
-  const data = encoder.encode(password)
-  const hash = await crypto.subtle.digest('SHA-256', data)
-  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+  const salt = new Uint8Array(SALT_BYTES)
+  crypto.getRandomValues(salt)
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']
+  )
+  const derived = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITERATIONS },
+    keyMaterial, KEY_BYTES * 8
+  )
+  return `pbkdf2:${buf2hex(salt.buffer)}:${buf2hex(derived)}`
 }
 
-async function verifyPassword(password: string, hash: string): Promise<boolean> {
-  return (await hashPassword(password)) === hash
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  // Support legacy plain SHA-256 base64 hashes (pre-migration)
+  if (!stored.startsWith('pbkdf2:')) {
+    const encoder = new TextEncoder()
+    const hash = await crypto.subtle.digest('SHA-256', encoder.encode(password))
+    return btoa(String.fromCharCode(...new Uint8Array(hash))) === stored
+  }
+  const parts = stored.split(':')
+  if (parts.length !== 3) return false
+  const [, saltHex, hashHex] = parts
+  const salt = hex2buf(saltHex)
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']
+  )
+  const derived = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITERATIONS },
+    keyMaterial, KEY_BYTES * 8
+  )
+  return buf2hex(derived) === hashHex
 }
 
-function generateToken(userId: number, role: string): string {
-  // Simple signed token: base64(payload).base64(sig)
-  const payload = btoa(JSON.stringify({ id: userId, role, exp: Date.now() + 7 * 24 * 60 * 60 * 1000 }))
-  return payload
+async function generateToken(userId: number, email: string, name: string, role: string): Promise<string> {
+  // Token format: base64(JSON payload).hex(SHA-256 sig) — matches reference backend
+  const payload = btoa(JSON.stringify({ id: userId, email, name, role, exp: Date.now() + 7 * 24 * 60 * 60 * 1000 }))
+  const sigBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload))
+  return `${payload}.${buf2hex(sigBuf)}`
 }
 
 function generateInviteToken(): string {
@@ -29,7 +69,9 @@ function generateInviteToken(): string {
 
 export function parseToken(token: string): { id: number; role: string; exp: number } | null {
   try {
-    return JSON.parse(atob(token))
+    // Format: "base64payload.hexsig" — strip the sig part before decoding
+    const payload = token.includes('.') ? token.split('.')[0] : token
+    return JSON.parse(atob(payload))
   } catch {
     return null
   }
@@ -81,7 +123,7 @@ auth.post('/login', async (c) => {
 
   await c.env.DB.prepare('UPDATE portal_users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').bind(user.id).run()
 
-  const token = generateToken(user.id, user.role)
+  const token = await generateToken(user.id, user.email, user.name, user.role)
   return c.json({
     token,
     user: {
@@ -122,7 +164,7 @@ auth.post('/setup-password', async (c) => {
 
   await c.env.DB.prepare('UPDATE portal_users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').bind(user.id).run()
 
-  const token = generateToken(user.id, user.role)
+  const token = await generateToken(user.id, user.email, user.name, user.role)
   return c.json({
     token,
     user: { id: user.id, email: user.email, name: user.name, role: user.role, contractor_id: user.contractor_id ?? null }
