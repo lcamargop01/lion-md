@@ -1,12 +1,21 @@
-import { Hono } from 'hono'
-import { renderer } from './renderer'
+const PROXY_ORIGIN = 'https://cc373d75.lionmd-payroll.pages.dev'
 
-const app = new Hono()
+export default {
+  async fetch(request: Request, env: any): Promise<Response> {
+    const url = new URL(request.url)
+    
+    // Proxy all API requests to the working deployment
+    if (url.pathname.startsWith('/api/')) {
+      const proxyUrl = PROXY_ORIGIN + url.pathname + url.search
+      const proxyReq = new Request(proxyUrl, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      })
+      return fetch(proxyReq)
+    }
 
-app.use(renderer)
-
-app.get('/', (c) => {
-  return c.render(<h1>Hello!</h1>)
-})
-
-export default app
+    // Let Cloudflare Pages serve static assets normally
+    return env.ASSETS.fetch(request)
+  }
+}
